@@ -32,14 +32,40 @@ import requests  # requires installation: pip install requests
 BUILD_VERSION = '2026.01.13'
 
 # CTIP API settings
-CTIP_API_BASE_URL                = 'https://api.dcuctip.com/ctip'
+CTIP_API_CTIP_BASE_URL           = 'https://api.dcuctip.com/ctip'
+CTIP_API_FRAUD_BASE_URL          = 'https://api.dcuctip.com/fraud'
 CTIP_API_INFECTED                = 'Infected'
 CTIP_API_C2                      = 'C2'
+CTIP_API_FRAUD_TSF               = 'TSFReportAScam'
 CTIP_API_OFFSET_INIT             = 1
 CTIP_API_MAX_RETRIES             = 3
 CTIP_API_MAX_RETRY_DELAY_SECONDS = 10
 CTIP_API_RETRY_DELAY_MULTIPLIER  = 3
 CTIP_USER_AGENT                  = 'Microsoft.DCU.CTIP.dcuctipapi'
+
+# Backward compatible alias used in older code.
+CTIP_API_BASE_URL                = CTIP_API_CTIP_BASE_URL
+
+CTIP_API_DATASETS = {
+    CTIP_API_INFECTED: {
+        'base_url': CTIP_API_CTIP_BASE_URL,
+        'time_param': 'hoursago',
+        'time_min': 1,
+        'time_max': 72
+    },
+    CTIP_API_C2: {
+        'base_url': CTIP_API_CTIP_BASE_URL,
+        'time_param': 'hoursago',
+        'time_min': 1,
+        'time_max': 72
+    },
+    CTIP_API_FRAUD_TSF: {
+        'base_url': CTIP_API_FRAUD_BASE_URL,
+        'time_param': 'daysago',
+        'time_min': 1,
+        'time_max': 180
+    }
+}
 
 # Global settings
 UTC_TIMESTAMP = datetime.now(timezone.utc)
@@ -57,13 +83,24 @@ BASE_SPACE = '    '
 # Class for storing CTIP API and program execution details
 #
 class Config:
-    def __init__(self, ctipApi, subscriptionName, subscriptionKey, dataFileTimestamp, hoursAgo = 1, saveCtipDataFiles= False):
+    def __init__(self, ctipApi, subscriptionName, subscriptionKey, dataFileTimestamp=None, hoursAgo=1, daysAgo=14, saveCtipDataFiles=False):
         self.CtipApi = ctipApi                      # The target CTIP API endpoint -- use constants CTIP_API_INFECTED or CTIP_API_C2
         self.SubscriptionName = subscriptionName    # A descriptive string used to name output files
         self.SubscriptionKey = subscriptionKey      # The subscription key provided by DCU to grant CTIP API access
         self.HoursAgo = hoursAgo                    # The timeframe to retrieve data from the CTIP API -- valid values are 1..72
+        self.DaysAgo = daysAgo                      # The timeframe to retrieve TSF data from the CTIP API -- valid values are 1..180
         self.SaveCtipDataFiles = saveCtipDataFiles  # Enable (True) or disable (False) saving of CTIP data downloaded from the API to a local file
-        self.DataFileTimestamp = dataFileTimestamp  # A timestamp for consistent file naming
+        self.DataFileTimestamp = dataFileTimestamp or datetime.now(timezone.utc).strftime('%Y.%m.%d_%H.%M.%S')  # A timestamp for consistent file naming
+
+def _get_dataset_settings(ctip_api: str) -> dict:
+    """
+    Returns dataset-specific API settings.
+    """
+    dataset = CTIP_API_DATASETS.get(ctip_api)
+    if dataset is None:
+        valid_datasets = ', '.join(sorted(CTIP_API_DATASETS.keys()))
+        raise ValueError(f'Unknown CTIP API dataset: {ctip_api}. Valid values: {valid_datasets}')
+    return dataset
 
 def ConfigureLogging():
     """
@@ -102,6 +139,10 @@ def CtipApi(config: Config) -> list:
         # List of all downloaded CTIP data 
         ctipDataDownload = []
 
+        dataset = _get_dataset_settings(config.CtipApi)
+        time_param = dataset['time_param']
+        time_value = config.HoursAgo if time_param == 'hoursago' else config.DaysAgo
+
         # Setup request headers
         apiHeaders = {
             'Ctip-Api-Subscription-Key': f'{config.SubscriptionKey}',
@@ -111,7 +152,7 @@ def CtipApi(config: Config) -> list:
         log.critical(f'>>>> Connecting to CTIP API: {config.CtipApi}')
         log.debug(f'          Subscription Name: {config.SubscriptionName}')
         log.debug(f'           Subscription Key: {config.SubscriptionKey}')
-        log.debug(f'           Timespan (hours): {config.HoursAgo}')
+        log.debug(f'     Timespan ({time_param}): {time_value}')
         log.critical(f'     [dc: Downloaded Data Count  //  tc: Total Downloaded Count]')
 
 
@@ -124,7 +165,7 @@ def CtipApi(config: Config) -> list:
         # *******************************************************************************************
         while True:
             # Setup request URL
-            apiUrl = f"{CTIP_API_BASE_URL}/{config.CtipApi.lower()}?hoursago={config.HoursAgo}&offset={offset}"
+            apiUrl = f"{dataset['base_url']}/{config.CtipApi.lower()}?{time_param}={time_value}&offset={offset}"
             log.debug(f'                    API URL: {apiUrl}')
             log.debug(f'                 Processing: {offset:07d}/{totalRowCount}')
 
@@ -203,7 +244,10 @@ def CtipApi(config: Config) -> list:
 
             # Check for 400 response
             elif apiResponse.status_code == HTTPStatus.BAD_REQUEST.value:
-                log.error(f'{BASE_SPACE} !!!> Encountered 400 error. Invalid value for the hoursago API parameter. Valid values are 1..72.')
+                log.error(
+                    f"{BASE_SPACE} !!!> Encountered 400 error. Invalid value for the {time_param} API parameter. "
+                    f"Valid values are {dataset['time_min']}..{dataset['time_max']}."
+                )
                 SaveErrorResponseHtml(htmlData=apiResponse.text, eventName='400error', config=config)
                 break # Cannot continue -- Exit out of the loop
             # Check for 403 response
@@ -328,6 +372,24 @@ def ProcessCtipData(ctipData: list, config: Config) -> int:
             # *******************************************************************************************
             # *******************************************************************************************
             # *******************************************************************************************
+
+    elif (config.CtipApi==CTIP_API_FRAUD_TSF):
+        log.debug(f'{BASE_SPACE} Processing decompressed CTIP TSF Data')
+
+        itemCount = 0
+        for objCtipData in ctipData:
+            itemCount += 1
+
+            # Display a realtime progress counter to console only
+            SetStatusMessage(f'Processing CTIP TSF data object: {itemCount} / {downloadedCtipItems}')
+
+            # TSF logging fields differ from Infected/C2 payloads.
+            log.info(
+                f'{BASE_SPACE} [{itemCount:07d} / {downloadedCtipItems:07d}] '
+                f'Operation: {objCtipData.get("Operation", "N/A")} // '
+                f'ThreatCode: {objCtipData.get("ThreatCode", "N/A")} // '
+                f'Report ID: {objCtipData.get("ReportID", "N/A")}'
+            )
 
 
     return downloadedCtipItems
